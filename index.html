@@ -80,6 +80,9 @@
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" defer></script>
   <script defer>
   window.addEventListener('DOMContentLoaded', () => {
+    // Hoisted placeholder so early references don’t crash
+    var PlumeOverlay = null;
+
     // ===== Constants & state (JS only) =====
     const R = 6371000, toDeg = 180/Math.PI;
     let running = false;
@@ -113,8 +116,8 @@
       .bindTooltip('Source', {permanent:true, direction:'top', offset:[0,-18]});
     const circle = L.circle(sourceCenter, { radius: sourceRadiusM, color:'#2b6cb0', weight:1.5, fillOpacity:0.05 }).addTo(map);
 
-    marker.on('move', e => { sourceCenter = e.latlng; circle.setLatLng(sourceCenter); if (autoWind) refreshWindFromAPI(); PlumeOverlay.markDirty(); });
-    map.on('click', e => { sourceCenter = e.latlng; marker.setLatLng(sourceCenter); circle.setLatLng(sourceCenter); if (autoWind) refreshWindFromAPI(); PlumeOverlay.markDirty(); });
+    marker.on('move', e => { sourceCenter = e.latlng; circle.setLatLng(sourceCenter); if (autoWind) refreshWindFromAPI(); if (PlumeOverlay) PlumeOverlay.markDirty(); });
+    map.on('click', e => { sourceCenter = e.latlng; marker.setLatLng(sourceCenter); circle.setLatLng(sourceCenter); if (autoWind) refreshWindFromAPI(); if (PlumeOverlay) PlumeOverlay.markDirty(); });
 
     // ===== Canvas overlay for particles (your original) =====
     const canvas = document.createElement('canvas');
@@ -128,8 +131,7 @@
       const pos = map._getMapPanePos();
       L.DomUtil.setPosition(canvas, pos.multiplyBy(-1));
       if (particles.length) draw();
-      PlumeOverlay.markDirty(); // keep plume in sync on resize/move/zoom
-      PlumeOverlay.drawIfNeeded();
+      if (PlumeOverlay) { PlumeOverlay.markDirty(); PlumeOverlay.drawIfNeeded(); }
     }
     map.on('resize zoom move', resizeCanvas);
     resizeCanvas();
@@ -195,7 +197,7 @@
       const rad = manualDir*Math.PI/180; // dir is FROM
       wind = { u: -manualSpeed*Math.sin(rad), v: -manualSpeed*Math.cos(rad), speed: manualSpeed, dir: manualDir };
       windStat.textContent = `wind: ${manualSpeed.toFixed(1)} m/s from ${manualDir.toFixed(0)}° (manual)`;
-      PlumeOverlay.markDirty();
+      if (PlumeOverlay) PlumeOverlay.markDirty();
     }
 
     function setupAutoWind(){
@@ -222,9 +224,7 @@
       } catch(e){
         windStat.textContent = 'wind: API failed; keeping previous';
         console.warn('Open-Meteo fetch failed', e);
-      } finally {
-        PlumeOverlay.markDirty();
-      }
+      } finally { if (PlumeOverlay) PlumeOverlay.markDirty(); }
     }
 
     // ===== Emission helpers =====
@@ -300,7 +300,7 @@
     }
 
     // ===== Gaussian Plume Overlay (drop-in) =====
-    const PlumeOverlay = (() => {
+    PlumeOverlay = (() => {
       const Rm = 6371000, toRad = Math.PI/180;
       let mapRef, getSrc, getWind, canvasP, ctxP;
       let enabled = true, dirty = true;
