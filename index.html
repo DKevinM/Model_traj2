@@ -1,0 +1,490 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Leaflet Particle Smoke — Live Wind + Gaussian (Clean JS)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <style>
+    html, body { height: 100%; margin: 0; }
+    #map { width: 100%; height: 100%; }
+    .control-bar { position:absolute; top:10px; left:10px; z-index:1000; background:rgba(255,255,255,.95); padding:10px 12px; border-radius:10px; font:14px system-ui, Arial; box-shadow:0 2px 10px rgba(0,0,0,.15); max-width:920px; }
+    .control-row { display:flex; gap:12px; align-items:center; margin:6px 0; flex-wrap:wrap; }
+    .btn { border:1px solid #ccc; padding:4px 10px; border-radius:6px; background:#f7f7f7; cursor:pointer; }
+    input[type=range]{ width:180px; }
+    .stat{ opacity:.85; }
+    select, input[type=number] { padding:2px 6px; }
+    label { white-space: nowrap; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div class="control-bar">
+    <div class="control-row">
+      <button id="start" class="btn">Start</button>
+      <button id="stop"  class="btn">Stop</button>
+      <span class="stat" id="fps">fps: —</span>
+    </div>
+    <div class="control-row">
+      <strong>Source</strong>
+      <label>Radius (m) <input id="radius" type="range" min="10" max="3000" step="10" value="10"></label>
+      <label>Spawn (p/s) <input id="spawn" type="range" min="10" max="4000" step="10" value="600"></label>
+      <label>Max p <input id="maxp" type="range" min="200" max="25000" step="200" value="5000"></label>
+      <span class="stat">Click map to move centre</span>
+    </div>
+    <div class="control-row">
+      <strong>Wind</strong>
+      <label><input id="manualWind" type="checkbox" checked> Manual</label>
+      <label>Speed (m/s) <input id="windSpeed" type="range" min="0" max="40" step="0.1" value="6"></label>
+      <label>Dir (° from) <input id="windDir" type="range" min="0" max="360" step="1" value="270"></label>
+      <label><input id="autoWind" type="checkbox"> Auto (Open-Meteo)</label>
+      <label>Refresh (min) <input id="windEvery" type="range" min="2" max="60" step="1" value="10"></label>
+      <button id="windNow" class="btn">Refresh now</button>
+      <span class="stat" id="windStat">wind: —</span>
+    </div>
+
+    <div>
+      <strong>Dispersion</strong>
+      <label>K (m²/s) <input id="K" type="range" min="0" max="200" step="1" value="30"></label>
+      <label>Tail len <input id="trail" type="range" min="0" max="120" step="1" value="12"></label>
+      <label>Tail fade <input id="tailFade" type="range" min="0" max="1" step="0.05" value="0.35"></label>
+      <label>Max age (s) <input id="maxAge" type="range" min="5" max="1200" step="5" value="100"></label>
+      <label><input id="gaussPuff" type="checkbox"> Puff bursts</label>
+      <label>Bursts/sec <input id="puffRate" type="range" min="0" max="5" step="0.1" value="0"></label>
+      <label>Time × <input id="timeScale" type="range" min="1" max="200" step="1" value="30"></label>
+      <label>Mode
+        <select id="mode">
+          <option value="cont" selected>Continuous</option>
+          <option value="puff">Puff</option>
+          <option value="both">Both</option>
+        </select>
+      </label>
+      <button id="reseed" class="btn">Reseed now</button>
+    </div>
+
+    <!-- New: Plume controls -->
+    <div class="control-row">
+      <strong>Plume (P to toggle)</strong>
+      <label>Q (g/s) <input id="plumeQ" type="number" step="1" value="10" style="width:80px"></label>
+      <label>H (m) <input id="plumeH" type="number" step="1" value="20" style="width:80px"></label>
+      <label>Stability
+        <select id="plumeStab">
+          <option>A</option><option>B</option><option>C</option>
+          <option selected>D</option><option>E</option><option>F</option>
+        </select>
+      </label>
+      <label><input id="plumeOn" type="checkbox" checked> Show</label>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" defer></script>
+  <script defer>
+  window.addEventListener('DOMContentLoaded', () => {
+    // ===== Constants & state (JS only) =====
+    const R = 6371000, toDeg = 180/Math.PI;
+    let running = false;
+
+    // Source
+    let sourceRadiusM = 10, spawnPerSec = 600, spawnAcc = 0, maxParticles = 5000;
+
+    // Trails/aging
+    let maxTrail = 12, tailFade = 0.35, maxLifesec = 30;
+
+    // Wind & time scaling
+    let manual = true, manualSpeed = 6.0, manualDir = 270;
+    let autoWind = false, autoWindEveryMin = 10, autoTimer = null;
+    let timeScale = 30; // visual speedup
+    let wind = {u:0,v:0,speed:0,dir:0}; // u east+, v north+, speed m/s, dir deg FROM
+
+    // Diffusion & puffs
+    let K = 30; // m^2/s
+    let gaussMode = false, puffRate = 0; // bursts per sec
+
+    // Particles
+    const particles = [];
+
+    // ===== Map =====
+    const map = L.map('map', { preferCanvas:true });
+    map.setView([53.5461, -113.4938], 10);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {maxZoom:19}).addTo(map);
+
+    let sourceCenter = L.latLng(53.5461, -113.4938);
+    const marker = L.marker(sourceCenter, {draggable:true}).addTo(map)
+      .bindTooltip('Source', {permanent:true, direction:'top', offset:[0,-18]});
+    const circle = L.circle(sourceCenter, { radius: sourceRadiusM, color:'#2b6cb0', weight:1.5, fillOpacity:0.05 }).addTo(map);
+
+    marker.on('move', e => { sourceCenter = e.latlng; circle.setLatLng(sourceCenter); if (autoWind) refreshWindFromAPI(); PlumeOverlay.markDirty(); });
+    map.on('click', e => { sourceCenter = e.latlng; marker.setLatLng(sourceCenter); circle.setLatLng(sourceCenter); if (autoWind) refreshWindFromAPI(); PlumeOverlay.markDirty(); });
+
+    // ===== Canvas overlay for particles (your original) =====
+    const canvas = document.createElement('canvas');
+    canvas.style.position='absolute'; canvas.style.top=0; canvas.style.left=0;
+    map.getPanes().overlayPane.appendChild(canvas);
+    const ctx = canvas.getContext('2d');
+
+    function resizeCanvas(){
+      const s = map.getSize();
+      canvas.width = s.x; canvas.height = s.y;
+      const pos = map._getMapPanePos();
+      L.DomUtil.setPosition(canvas, pos.multiplyBy(-1));
+      if (particles.length) draw();
+      PlumeOverlay.markDirty(); // keep plume in sync on resize/move/zoom
+      PlumeOverlay.drawIfNeeded();
+    }
+    map.on('resize zoom move', resizeCanvas);
+    resizeCanvas();
+
+    // ===== UI wiring =====
+    const fpsEl = document.getElementById('fps');
+    const windStat = document.getElementById('windStat');
+
+    // Source controls
+    document.getElementById('radius').oninput = e => { sourceRadiusM = +e.target.value; circle.setRadius(sourceRadiusM); };
+    document.getElementById('spawn').oninput  = e => { spawnPerSec   = +e.target.value; };
+    document.getElementById('maxp').oninput   = e => { maxParticles  = +e.target.value; };
+
+    // Wind controls
+    const manualEl = document.getElementById('manualWind');
+    const wsEl = document.getElementById('windSpeed');
+    const wdEl = document.getElementById('windDir');
+    const autoEl = document.getElementById('autoWind');
+    const everyEl = document.getElementById('windEvery');
+    const windNow = document.getElementById('windNow');
+
+    manualEl.onchange = () => { manual = manualEl.checked; if (manual) updateManualWind(); };
+    wsEl.oninput = () => { manualSpeed = +wsEl.value; if (manual) updateManualWind(); };
+    wdEl.oninput = () => { manualDir   = +wdEl.value; if (manual) updateManualWind(); };
+    autoEl.onchange = () => { autoWind = autoEl.checked; setupAutoWind(); };
+    everyEl.oninput = () => { autoWindEveryMin = +everyEl.value; setupAutoWind(); };
+    windNow.onclick = () => refreshWindFromAPI();
+
+    // Dispersion controls
+    document.getElementById('K').oninput = e => { K = +e.target.value; };
+    document.getElementById('trail').oninput = e => { maxTrail = +e.target.value; };
+    document.getElementById('tailFade').oninput = e => { tailFade = +e.target.value; };
+    document.getElementById('maxAge').oninput = e => { maxLifesec = +e.target.value; };
+    document.getElementById('gaussPuff').onchange = e => { gaussMode = e.target.checked; };
+    document.getElementById('puffRate').oninput = e => { puffRate = +e.target.value; };
+    document.getElementById('timeScale').oninput = e => { timeScale = +e.target.value; };
+    const modeEl = document.getElementById('mode');
+    let mode = modeEl.value;
+    modeEl.addEventListener('change', () => {
+      mode = modeEl.value;
+      spawnAcc = 0;
+      if (mode === 'puff') {
+        particles.length = 0;
+        draw();
+        if (puffRate === 0) {
+          puffRate = 1;
+          document.getElementById('puffRate').value = 1;
+        }
+      }
+    });
+
+    // Start/Stop
+    document.getElementById('start').onclick = () => {
+      particles.length = 0;
+      if (mode === 'cont' || mode === 'both') seedSome(1200);
+      running = true;
+      last = performance.now();
+    };
+    document.getElementById('stop').onclick  = () => { running = false; particles.length = 0; draw(); };
+
+    // ===== Wind helpers =====
+    function updateManualWind(){
+      const rad = manualDir*Math.PI/180; // dir is FROM
+      wind = { u: -manualSpeed*Math.sin(rad), v: -manualSpeed*Math.cos(rad), speed: manualSpeed, dir: manualDir };
+      windStat.textContent = `wind: ${manualSpeed.toFixed(1)} m/s from ${manualDir.toFixed(0)}° (manual)`;
+      PlumeOverlay.markDirty();
+    }
+
+    function setupAutoWind(){
+      if (autoTimer){ clearInterval(autoTimer); autoTimer = null; }
+      if (autoWind){
+        manual = false; manualEl.checked = false;
+        refreshWindFromAPI();
+        autoTimer = setInterval(refreshWindFromAPI, Math.max(2, autoWindEveryMin)*60*1000);
+      }
+    }
+
+    async function refreshWindFromAPI(){
+      try {
+        const url = `https://api.open-meteo.com/v1/forecast?latitude=${sourceCenter.lat.toFixed(4)}&longitude=${sourceCenter.lng.toFixed(4)}&hourly=wind_speed_10m,wind_direction_10m&forecast_days=1&windspeed_unit=ms`;
+        const r = await fetch(url);
+        const j = await r.json();
+        const i = 0; // current hour
+        const spd = j?.hourly?.wind_speed_10m?.[i];
+        const dir = j?.hourly?.wind_direction_10m?.[i];
+        if (spd==null || dir==null) throw new Error('API missing fields');
+        const rad = dir*Math.PI/180;
+        wind = { u: -spd*Math.sin(rad), v: -spd*Math.cos(rad), speed: spd, dir };
+        windStat.textContent = `wind: ${spd.toFixed(1)} m/s from ${dir.toFixed(0)}° (API)`;
+      } catch(e){
+        windStat.textContent = 'wind: API failed; keeping previous';
+        console.warn('Open-Meteo fetch failed', e);
+      } finally {
+        PlumeOverlay.markDirty();
+      }
+    }
+
+    // ===== Emission helpers =====
+    function jitterDiskMeters(centerLL, radiusM){
+      const r = radiusM*Math.sqrt(Math.random());
+      const th = Math.random()*Math.PI*2;
+      const dy = r*Math.sin(th), dx = r*Math.cos(th);
+      const dlat = (dy/R)*toDeg;
+      const dlon = (dx/(R*Math.max(1e-6, Math.cos(centerLL.lat*Math.PI/180))))*toDeg;
+      return L.latLng(centerLL.lat + dlat, centerLL.lng + dlon);
+    }
+
+    function seedSome(n=1200){
+      for (let i=0;i<n;i++){
+        const ll = jitterDiskMeters(sourceCenter, sourceRadiusM);
+        particles.push({ lat: ll.lat, lon: ll.lng, age: Math.random()*maxLifesec*0.7, trail: [] });
+      }
+    }
+
+    function spawn(dt){
+      if (mode === 'cont' || mode === 'both') {
+        spawnAcc += spawnPerSec*dt;
+        let make = Math.floor(spawnAcc);
+        spawnAcc -= make;
+        make = Math.min(make, Math.max(0, maxParticles - particles.length));
+        for (let i=0;i<make;i++){
+          const ll = jitterDiskMeters(sourceCenter, sourceRadiusM);
+          particles.push({ lat: ll.lat, lon: ll.lng, age: 0, trail: [], puff:false });
+        }
+      }
+      if ((mode === 'puff' || mode === 'both') && puffRate > 0){
+        const expected = puffRate*dt;
+        if (Math.random() < expected){
+          const ll0 = jitterDiskMeters(sourceCenter, Math.max(5, 0.2*sourceRadiusM));
+          const puffN = Math.min(200, Math.max(20, Math.round(spawnPerSec*0.2)));
+          for (let i=0;i<puffN && particles.length<maxParticles;i++){
+            const ll = jitterDiskMeters(ll0, Math.max(5, sourceRadiusM*0.1));
+            particles.push({ lat: ll.lat, lon: ll.lng, age: 0, trail: [], puff:true });
+          }
+        }
+      }
+    }
+
+    // ===== Physics =====
+    function step(dtReal){
+      const dt = dtReal * timeScale;
+      if (manual && !autoWind) updateManualWind();
+
+      spawn(dt);
+      const u = wind.u, v = wind.v;
+      const sig = Math.sqrt(Math.max(0, 2*K*dt));
+
+      for (let p of particles){
+        if (maxTrail>0){
+          p.trail.push([p.lat, p.lon]);
+          if (p.trail.length>maxTrail) p.trail.shift();
+        }
+        const coslat = Math.cos(p.lat*Math.PI/180);
+        p.lat += (v/R)*toDeg*dt; // advection
+        p.lon += (u/(R*Math.max(1e-6,coslat)))*toDeg*dt;
+        if (sig>0){
+          const th = Math.random()*2*Math.PI;
+          const dy = sig*Math.sin(th), dx = sig*Math.cos(th);
+          p.lat += (dy/R)*toDeg;
+          p.lon += (dx/(R*Math.max(1e-6, Math.cos(p.lat*Math.PI/180))))*toDeg;
+        }
+        p.age = (p.age || 0) + dt;
+        if (p.age > maxLifesec){
+          const ll = jitterDiskMeters(sourceCenter, sourceRadiusM);
+          p.lat = ll.lat; p.lon = ll.lng; p.age = 0; p.trail.length = 0; p.puff=false;
+        }
+      }
+    }
+
+    // ===== Gaussian Plume Overlay (drop-in) =====
+    const PlumeOverlay = (() => {
+      const Rm = 6371000, toRad = Math.PI/180;
+      let mapRef, getSrc, getWind, canvasP, ctxP;
+      let enabled = true, dirty = true;
+      let Q_gps = 10, H_m = 20, stab = 'D';
+
+      const classes = {
+        A:{ay:0.22,by:0.5, az:0.20,bz:0.5},
+        B:{ay:0.16,by:0.5, az:0.12,bz:0.5},
+        C:{ay:0.11,by:0.5, az:0.08,bz:0.5},
+        D:{ay:0.08,by:0.5, az:0.06,bz:0.5},
+        E:{ay:0.06,by:0.5, az:0.03,bz:0.5},
+        F:{ay:0.04,by:0.5, az:0.016,bz:0.5}
+      };
+
+      function ensureCanvas(){
+        if (canvasP) return;
+        canvasP = document.createElement('canvas');
+        canvasP.style.position='absolute';
+        canvasP.style.top=0; canvasP.style.left=0; canvasP.style.pointerEvents='none';
+        mapRef.getPanes().overlayPane.appendChild(canvasP);
+        ctxP = canvasP.getContext('2d');
+      }
+      function resize(){
+        if (!canvasP) return;
+        const s = mapRef.getSize();
+        canvasP.width = s.x; canvasP.height = s.y;
+        const pos = mapRef._getMapPanePos();
+        L.DomUtil.setPosition(canvasP, pos.multiplyBy(-1));
+        dirty = true;
+      }
+      function sigmas(x){
+        const C = classes[stab] || classes.D;
+        const X = Math.max(1, x);
+        return {
+          sy: Math.max(0.5, C.ay*Math.pow(X, C.by)),
+          sz: Math.max(0.5, C.az*Math.pow(X, C.bz))
+        };
+      }
+      function Cground(Q,u,H,x,y,sy,sz){
+        if (x<=0 || u<=0) return 0;
+        const core = Q/(2*Math.PI*u*sy*sz);
+        const cy = Math.exp(-(y*y)/(2*sy*sy));
+        const cz = 2*Math.exp(-(H*H)/(2*sz*sz));
+        return core*cy*cz; // g/m^3
+      }
+      function metersFrom(ref, ll){
+        const dLat = (ll.lat - ref.lat)*toRad, dLon = (ll.lng - ref.lng)*toRad;
+        return { x: Rm*dLon*Math.cos(ref.lat*toRad), y: Rm*dLat };
+      }
+      function rotate(x,y,deg){
+        const th = deg*toRad, c=Math.cos(th), s=Math.sin(th);
+        return {x:c*x - s*y, y:s*x + c*y};
+      }
+      function ramp(val, vmin, vmax){
+        if (val<=vmin) return [0,0,0,0];
+        const t = Math.min(1, Math.max(0, (Math.log(val)-Math.log(vmin))/(Math.log(vmax)-Math.log(vmin))));
+        const r = Math.floor(255*t), g = Math.floor(200*Math.pow(t,0.7)), b = Math.floor(80*Math.pow(t,0.4)), a = Math.floor(220*Math.min(1, t*1.3));
+        return [r,g,b,a];
+      }
+      function draw(){
+        if (!enabled || !canvasP || !dirty) return;
+        const s = mapRef.getSize();
+        ctxP.clearRect(0,0,s.x,s.y);
+
+        const w = getWind(); const u = Math.max(0, w?.speed||0);
+        if (u<=0.05){ dirty=false; return; }
+        const dirTO = ((w.dir||0)+180)%360;
+
+        const src = getSrc();
+        const srcPt = mapRef.latLngToLayerPoint(src);
+
+        // find vmax along centerline to normalize
+        let vmax = 0, vmin = 1e-8;
+        for (let px=srcPt.x; px<canvasP.width; px+=24){
+          const ll = mapRef.layerPointToLatLng([px, srcPt.y]);
+          const d = metersFrom(src, ll);
+          const rot = rotate(d.x, d.y, -dirTO);
+          if (rot.x<=0) continue;
+          const {sy,sz} = sigmas(rot.x);
+          const C = Cground(Q_gps, u, H_m, rot.x, 0, sy, sz);
+          if (C>vmax) vmax=C;
+        }
+        if (vmax < 1e-8){ dirty=false; return; }
+
+        // coarse raster
+        const step = 4;
+        for (let py=0; py<canvasP.height; py+=step){
+          for (let px=0; px<canvasP.width; px+=step){
+            const ll = mapRef.layerPointToLatLng([px, py]);
+            const d = metersFrom(src, ll);
+            const rot = rotate(d.x, d.y, -dirTO);
+            if (rot.x<=0) continue;
+            const {sy,sz} = sigmas(rot.x);
+            const C = Cground(Q_gps, u, H_m, rot.x, rot.y, sy, sz);
+            if (C<=vmin) continue;
+            const [r,g,b,a] = ramp(C, vmin, vmax);
+            ctxP.fillStyle = `rgba(${r},${g},${b},${a/255})`;
+            ctxP.fillRect(px, py, step, step);
+          }
+        }
+        dirty = false;
+      }
+
+      return {
+        init: (map, getSourceLL, getWindFn) => {
+          mapRef = map; getSrc = getSourceLL; getWind = getWindFn;
+          ensureCanvas(); resize();
+          mapRef.on('zoom move resize', () => { resize(); });
+          window.addEventListener('keydown', e => {
+            if (e.key.toLowerCase()==='p'){ enabled=!enabled; dirty=true; draw(); document.getElementById('plumeOn').checked = enabled; }
+          });
+        },
+        setQ: (q)=>{ Q_gps = Math.max(0, +q||0); dirty=true; },
+        setH: (h)=>{ H_m = Math.max(0, +h||0); dirty=true; },
+        setStab: (c)=>{ stab = (''+c).toUpperCase(); dirty=true; },
+        setEnabled: (on)=>{ enabled=!!on; dirty=true; },
+        markDirty: ()=>{ dirty=true; },
+        drawIfNeeded: ()=> draw()
+      };
+    })();
+
+    // Initialize plume overlay and wire UI
+    PlumeOverlay.init(map, () => sourceCenter, () => ({ speed: wind.speed, dir: wind.dir }));
+    PlumeOverlay.setQ(+document.getElementById('plumeQ').value);
+    PlumeOverlay.setH(+document.getElementById('plumeH').value);
+    PlumeOverlay.setStab(document.getElementById('plumeStab').value);
+    PlumeOverlay.setEnabled(document.getElementById('plumeOn').checked);
+
+    document.getElementById('plumeQ').oninput = (e)=>{ PlumeOverlay.setQ(e.target.value); PlumeOverlay.markDirty(); PlumeOverlay.drawIfNeeded(); };
+    document.getElementById('plumeH').oninput = (e)=>{ PlumeOverlay.setH(e.target.value); PlumeOverlay.markDirty(); PlumeOverlay.drawIfNeeded(); };
+    document.getElementById('plumeStab').onchange = (e)=>{ PlumeOverlay.setStab(e.target.value); PlumeOverlay.markDirty(); PlumeOverlay.drawIfNeeded(); };
+    document.getElementById('plumeOn').onchange = (e)=>{ PlumeOverlay.setEnabled(e.target.checked); PlumeOverlay.markDirty(); PlumeOverlay.drawIfNeeded(); };
+
+    // ===== Draw (your original + plume call) =====
+    function draw(){
+      // Draw plume first (separate canvas)
+      PlumeOverlay.drawIfNeeded();
+
+      const s = map.getSize();
+      ctx.clearRect(0,0,s.x,s.y);
+
+      if (maxTrail>1){
+        ctx.beginPath();
+        for (let p of particles){
+          if (p.trail && p.trail.length>1){
+            const pt0 = map.latLngToLayerPoint(p.trail[0]); ctx.moveTo(pt0.x, pt0.y);
+            for (let i=1;i<p.trail.length;i++){
+              const pti = map.latLngToLayerPoint(p.trail[i]); ctx.lineTo(pti.x, pti.y);
+            }
+          }
+        }
+        ctx.lineWidth = 1;
+        ctx.strokeStyle = `rgba(80,80,80,${tailFade})`;
+        ctx.stroke();
+      }
+
+      for (let p of particles){
+        const pt = map.latLngToLayerPoint([p.lat, p.lon]);
+        ctx.beginPath(); ctx.arc(pt.x, pt.y, 1.6, 0, Math.PI*2);
+        ctx.fillStyle = 'rgba(30,30,30,0.85)'; ctx.fill();
+      }
+    }
+
+    // ===== Animation =====
+    let last = performance.now(), frames=0, acc=0;
+    function animate(){
+      const now = performance.now();
+      const dt = Math.min(0.05, (now-last)/1000);
+      last = now;
+      if (running){
+        step(dt);
+        if ((frames & 1) === 0) draw();
+        frames++; acc += dt;
+        if (acc>=0.5){ fpsEl.textContent = `fps: ${(frames/acc).toFixed(0)}`; frames=0; acc=0; }
+      }
+      requestAnimationFrame(animate);
+    }
+    requestAnimationFrame(animate);
+
+    // ===== Seed & autostart =====
+    updateManualWind();
+    draw();
+    // running = true;
+  });
+  </script>
+</body>
+</html>
